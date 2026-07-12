@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -12,6 +13,9 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 load_dotenv()
@@ -22,8 +26,7 @@ DATA_FILE = os.path.join(DATA_DIR, "data.json")
 CUSTOM_BOSSES_FILE = os.path.join(DATA_DIR, "custom_bosses.json")
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Kyiv"))
 
-ADDBOSS_FORMAT = "код|Имя|карта|локация|мин_минут|макс_минут"
-ADDBOSS_EXAMPLE = "baphomet|Baphomet|prt_maze03|Maze Dungeon 3F|60|70"
+ASK_NAME, ASK_LOCATION, ASK_MIN, ASK_MAX = range(4)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -113,13 +116,20 @@ def boss_pick_keyboard(chat_id: int, prefix: str, codes=None) -> InlineKeyboardM
 
 
 def myboss_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    custom = load_custom_bosses().get(str(chat_id), {})
-    rows = [
-        [InlineKeyboardButton(f"🗑 {b['name']}", callback_data=f"delboss:{code}")]
-        for code, b in custom.items()
-    ]
+    bosses = effective_bosses(chat_id)
+    custom_codes = load_custom_bosses().get(str(chat_id), {}).keys()
+    rows = [[InlineKeyboardButton("➕ Добавить нового босса", callback_data="addboss_start")]]
+    for code, b in bosses.items():
+        row = [InlineKeyboardButton(f"✏️ {b['name']}", callback_data=f"editboss:{code}")]
+        if code in custom_codes:
+            row.append(InlineKeyboardButton("🗑", callback_data=f"delboss:{code}"))
+        rows.append(row)
     rows.append([InlineKeyboardButton("🔙 Назад", callback_data="main")])
     return InlineKeyboardMarkup(rows)
+
+
+def wizard_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Отмена", callback_data="wizard_cancel")]])
 
 
 # ---------- text rendering ----------
@@ -130,9 +140,10 @@ def render_boss_list(chat_id: int) -> str:
     lines = ["📋 <b>Боссы</b>\n"]
     for code, b in bosses.items():
         mark = "✏️ " if code in custom_codes else ""
+        map_suffix = f" ({b['map']})" if b.get("map") else ""
         lines.append(
-            f"{mark}⚔️ <b>{b['name']}</b>  <code>{code}</code>\n"
-            f"    🗺 {b['location']} ({b['map']})\n"
+            f"{mark}⚔️ <b>{b['name']}</b>\n"
+            f"    🗺 {b['location']}{map_suffix}\n"
             f"    ⏱ респавн {b['min_minutes']}–{b['max_minutes']} мин\n"
         )
     lines.append("✏️ — твой добавленный/изменённый босс. Смотри ⚙️ Мои боссы, чтобы добавить свой.")
@@ -352,82 +363,123 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def addboss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.split(maxsplit=1)
-    if len(raw) < 2 or "|" not in raw[1]:
-        await update.message.reply_text(
-            "Использование:\n<code>/addboss " + ADDBOSS_FORMAT + "</code>\n\n"
-            "Пример:\n<code>/addboss " + ADDBOSS_EXAMPLE + "</code>\n\n"
-            "Можно так же переопределить встроенного босса — просто укажи его код (eddga, atroce, rsx0806).",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+# ---------- add/edit boss wizard (button-driven) ----------
 
-    parts = [p.strip() for p in raw[1].split("|")]
-    if len(parts) != 6:
-        await update.message.reply_text(
-            "Нужно ровно 6 полей через '|': " + ADDBOSS_FORMAT
-        )
-        return
+async def addboss_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["boss_wizard"] = {"mode": "add"}
+    text = "➕ Как назовём босса?"
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=wizard_cancel_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=wizard_cancel_keyboard())
+    return ASK_NAME
 
-    code, name, map_, location, min_str, max_str = parts
-    code = code.lower().replace(" ", "_")
-    if not code or not name:
-        await update.message.reply_text("Код и имя не могут быть пустыми.")
-        return
+
+async def editboss_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    code = query.data.split(":", 1)[1]
+    boss = effective_bosses(chat_id).get(code)
+    if boss is None:
+        await query.edit_message_text("Босс не найден.", reply_markup=myboss_keyboard(chat_id))
+        return ConversationHandler.END
+
+    context.user_data["boss_wizard"] = {
+        "mode": "edit",
+        "code": code,
+        "name": boss["name"],
+        "map": boss.get("map", ""),
+        "location": boss["location"],
+    }
+    await query.edit_message_text(
+        f"✏️ <b>{boss['name']}</b>\nСейчас: {boss['min_minutes']}–{boss['max_minutes']} мин.\n\n"
+        f"Какой новый минимум респавна, в минутах?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=wizard_cancel_keyboard(),
+    )
+    return ASK_MIN
+
+
+async def wizard_got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Название не может быть пустым. Как назовём босса?", reply_markup=wizard_cancel_keyboard())
+        return ASK_NAME
+    context.user_data["boss_wizard"]["name"] = name
+    await update.message.reply_text(
+        "🗺 Где он респавнится? (карта/локация, как удобно)", reply_markup=wizard_cancel_keyboard()
+    )
+    return ASK_LOCATION
+
+
+async def wizard_got_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    location = update.message.text.strip()
+    if not location:
+        await update.message.reply_text("Локация не может быть пустой. Где он респавнится?", reply_markup=wizard_cancel_keyboard())
+        return ASK_LOCATION
+    context.user_data["boss_wizard"]["location"] = location
+    context.user_data["boss_wizard"]["map"] = ""
+    await update.message.reply_text(
+        "⏱ Какой минимум респавна, в минутах? (например 120)", reply_markup=wizard_cancel_keyboard()
+    )
+    return ASK_MIN
+
+
+async def wizard_got_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        min_m = int(min_str)
-        max_m = int(max_str)
+        min_m = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("Минуты должны быть целыми числами.")
-        return
-    if min_m <= 0 or max_m < min_m:
-        await update.message.reply_text("Проверь минуты: минимум > 0 и максимум >= минимума.")
-        return
+        await update.message.reply_text("Нужно целое число минут. Попробуй ещё раз:", reply_markup=wizard_cancel_keyboard())
+        return ASK_MIN
     if min_m <= 10:
-        await update.message.reply_text("Минимальный респавн должен быть больше 10 минут (нужно место для предупреждения за 10 мин).")
-        return
+        await update.message.reply_text(
+            "Минимум должен быть больше 10 минут (нужно место для предупреждения за 10 мин). Попробуй ещё раз:",
+            reply_markup=wizard_cancel_keyboard(),
+        )
+        return ASK_MIN
+    context.user_data["boss_wizard"]["min_minutes"] = min_m
+    await update.message.reply_text(
+        f"⏱ А максимум? (например {min_m + 10})", reply_markup=wizard_cancel_keyboard()
+    )
+    return ASK_MAX
+
+
+async def wizard_got_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wizard = context.user_data["boss_wizard"]
+    try:
+        max_m = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Нужно целое число минут. Попробуй ещё раз:", reply_markup=wizard_cancel_keyboard())
+        return ASK_MAX
+    if max_m < wizard["min_minutes"]:
+        await update.message.reply_text(
+            f"Максимум должен быть не меньше минимума ({wizard['min_minutes']}). Попробуй ещё раз:",
+            reply_markup=wizard_cancel_keyboard(),
+        )
+        return ASK_MAX
 
     chat_id = update.effective_chat.id
-    upsert_custom_boss(chat_id, code, name, map_, location, min_m, max_m)
+    code = wizard.get("code") or f"c{uuid.uuid4().hex[:8]}"
+    upsert_custom_boss(
+        chat_id, code, wizard["name"], wizard.get("map", ""), wizard["location"], wizard["min_minutes"], max_m
+    )
+    context.user_data.pop("boss_wizard", None)
     await update.message.reply_text(
-        f"✅ Босс <b>{name}</b> (<code>{code}</code>) сохранён: респавн {min_m}–{max_m} мин.",
+        f"✅ <b>{wizard['name']}</b> сохранён: респавн {wizard['min_minutes']}–{max_m} мин.",
         parse_mode=ParseMode.HTML,
         reply_markup=back_keyboard(),
     )
+    return ConversationHandler.END
 
 
-async def delboss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Использование: /delboss <код>")
-        return
-    chat_id = update.effective_chat.id
-    code = context.args[0].lower().strip()
-    if remove_custom_boss(chat_id, code):
-        await update.message.reply_text(f"🗑 Босс <code>{code}</code> удалён из твоего списка.", parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text("У тебя нет такого добавленного/изменённого босса.")
-
-
-async def myboss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    custom = load_custom_bosses().get(str(chat_id), {})
-    if not custom:
-        await update.message.reply_text(
-            "У тебя пока нет своих боссов.\n\n"
-            "Добавь командой:\n<code>/addboss " + ADDBOSS_FORMAT + "</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard(),
-        )
-        return
-    lines = ["⚙️ <b>Твои боссы</b>\n"]
-    for code, b in custom.items():
-        lines.append(
-            f"✏️ <b>{b['name']}</b>  <code>{code}</code> — {b['location']}, "
-            f"респавн {b['min_minutes']}–{b['max_minutes']} мин"
-        )
-    lines.append("\nУдалить: <code>/delboss код</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=back_keyboard())
+async def wizard_cancelled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("boss_wizard", None)
+    await query.edit_message_text("Отменено.", reply_markup=myboss_keyboard(query.message.chat_id))
+    return ConversationHandler.END
 
 
 # ---------- callback (inline menu) ----------
@@ -491,17 +543,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "myboss_menu":
-        custom = load_custom_bosses().get(str(chat_id), {})
         text = (
             "⚙️ <b>Мои боссы</b>\n\n"
-            "Добавить или изменить таймер (в том числе встроенного босса):\n"
-            f"<code>/addboss {ADDBOSS_FORMAT}</code>\n"
-            f"Пример: <code>/addboss {ADDBOSS_EXAMPLE}</code>\n\n"
+            "➕ — добавить нового.\n"
+            "✏️ — изменить таймер респавна (можно и у встроенных).\n"
+            "🗑 — удалить свой добавленный/изменённый босс."
         )
-        if custom:
-            text += "Нажми, чтобы удалить свой боссовский таймер:"
-        else:
-            text += "Своих боссов пока нет."
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=myboss_keyboard(chat_id))
 
     elif data.startswith("delboss:"):
@@ -538,9 +585,6 @@ async def post_init(app: Application):
             BotCommand("status", "Мой статус по всем боссам"),
             BotCommand("list", "Список боссов и кодов"),
             BotCommand("cancel", "Отменить отметку: /cancel код"),
-            BotCommand("addboss", "Добавить/изменить своего босса"),
-            BotCommand("delboss", "Удалить своего босса: /delboss код"),
-            BotCommand("myboss", "Список своих добавленных боссов"),
         ]
     )
 
@@ -552,15 +596,28 @@ def main():
 
     app = Application.builder().token(token).post_init(post_init).build()
 
+    boss_wizard = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(addboss_start, pattern="^addboss_start$"),
+            CallbackQueryHandler(editboss_start, pattern="^editboss:"),
+        ],
+        states={
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_got_name)],
+            ASK_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_got_location)],
+            ASK_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_got_min)],
+            ASK_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_got_max)],
+        },
+        fallbacks=[CallbackQueryHandler(wizard_cancelled, pattern="^wizard_cancel$")],
+        conversation_timeout=300,
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("list", list_bosses))
     app.add_handler(CommandHandler("kill", kill))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("addboss", addboss))
-    app.add_handler(CommandHandler("delboss", delboss))
-    app.add_handler(CommandHandler("myboss", myboss))
+    app.add_handler(boss_wizard)
     app.add_handler(CallbackQueryHandler(on_callback))
 
     reschedule_pending(app)
