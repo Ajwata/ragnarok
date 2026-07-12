@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,6 +19,11 @@ load_dotenv()
 BOSSES_FILE = "bosses.json"
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
+TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Kyiv"))
+
+
+def now() -> datetime:
+    return datetime.now(TZ)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -93,7 +99,7 @@ def render_boss_list() -> str:
 def render_status(chat_id: int) -> str:
     data = load_data()
     chat_entries = data.get(str(chat_id), {})
-    now = datetime.now()
+    current = now()
     lines = ["📊 <b>Твой статус</b>\n"]
     for code, b in BOSSES.items():
         entry = chat_entries.get(code)
@@ -102,10 +108,10 @@ def render_status(chat_id: int) -> str:
             continue
         start_at = datetime.fromisoformat(entry["start_at"])
         end_at = datetime.fromisoformat(entry["end_at"])
-        if now < start_at:
-            mins = int((start_at - now).total_seconds() // 60)
+        if current < start_at:
+            mins = int((start_at - current).total_seconds() // 60)
             lines.append(f"🟡 <b>{b['name']}</b> — окно через {mins} мин ({start_at.strftime('%H:%M')})")
-        elif now <= end_at:
+        elif current <= end_at:
             lines.append(f"🟢 <b>{b['name']}</b> — окно ОТКРЫТО, до {end_at.strftime('%H:%M')}")
         else:
             lines.append(f"🔴 <b>{b['name']}</b> — окно прошло ({end_at.strftime('%H:%M')}), отметь заново")
@@ -130,7 +136,7 @@ def schedule_for_boss(app: Application, chat_id: int, code: str, killed_at: date
     warn_at = killed_at + timedelta(minutes=b["min_minutes"] - 10)
     start_at = killed_at + timedelta(minutes=b["min_minutes"])
     end_at = killed_at + timedelta(minutes=b["max_minutes"])
-    now = datetime.now()
+    current = now()
 
     for job in (
         app.job_queue.get_jobs_by_name(job_name(chat_id, code, "warn"))
@@ -138,11 +144,11 @@ def schedule_for_boss(app: Application, chat_id: int, code: str, killed_at: date
     ):
         job.schedule_removal()
 
-    if warn_at > now:
+    if warn_at > current:
         app.job_queue.run_once(
             send_warning, when=warn_at, chat_id=chat_id, name=job_name(chat_id, code, "warn"), data=code
         )
-    if start_at > now:
+    if start_at > current:
         app.job_queue.run_once(
             send_window_start,
             when=start_at,
@@ -238,15 +244,15 @@ async def kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) > 1:
         try:
             hh, mm = map(int, context.args[1].split(":"))
-            now = datetime.now()
-            killed_at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if killed_at > now:
+            current = now()
+            killed_at = current.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if killed_at > current:
                 killed_at -= timedelta(days=1)
         except ValueError:
             await update.message.reply_text("Неверный формат времени. Используй ЧЧ:ММ, например 14:35")
             return
     else:
-        killed_at = datetime.now()
+        killed_at = now()
 
     start_at, end_at = record_kill(context.application, update.effective_chat.id, code, killed_at)
     b = BOSSES[code]
@@ -304,7 +310,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if code not in BOSSES:
             await query.edit_message_text("Неизвестный босс.", reply_markup=main_menu_keyboard())
             return
-        killed_at = datetime.now()
+        killed_at = now()
         start_at, end_at = record_kill(context.application, chat_id, code, killed_at)
         b = BOSSES[code]
         await query.edit_message_text(
@@ -334,13 +340,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def reschedule_pending(app: Application):
     data = load_data()
-    now = datetime.now()
+    current = now()
     restored = 0
     for chat_key, entries in data.items():
         chat_id = int(chat_key)
         for code, entry in entries.items():
             end_at = datetime.fromisoformat(entry["end_at"])
-            if end_at < now:
+            if end_at < current:
                 continue
             killed_at = datetime.fromisoformat(entry["killed_at"])
             schedule_for_boss(app, chat_id, code, killed_at)
