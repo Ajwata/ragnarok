@@ -1,0 +1,26 @@
+{
+  "eddga": {
+    "name": "Eddga",
+    "mob_id": 1115,
+    "map": "pay_fild11",
+    "location": "Payon Forest",
+    "min_minutes": 120,
+    "max_minutes": 130
+  },
+  "atroce": {
+    "name": "Atroce",
+    "mob_id": 1785,
+    "map": "ve_fild01",
+    "location": "Veins Field",
+    "min_minutes": 180,
+    "max_minutes": 190
+  },
+  "rsx0806": {
+    "name": "RSX-0806",
+    "mob_id": 1623,
+    "map": "ein_dun02",
+    "location": "Einbech Mine Dungeon 2F",
+    "min_minutes": 125,
+    "max_minutes": 135
+  }
+}
