@@ -31,6 +31,9 @@ ASK_NAME, ASK_LOCATION, ASK_MIN, ASK_MAX = range(4)
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 log = logging.getLogger("ragnarok-boss-bot")
 
 
