@@ -10,8 +10,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv()
 
 BOSSES_FILE = "bosses.json"
-DATA_FILE = "data.json"
-CHAT_ID_FILE = "chat_id.txt"
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -36,19 +36,6 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def load_chat_id():
-    if os.path.exists(CHAT_ID_FILE):
-        with open(CHAT_ID_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            return int(content) if content else None
-    return None
-
-
-def save_chat_id(chat_id: int):
-    with open(CHAT_ID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(chat_id))
-
-
 BOSSES = load_bosses()
 
 
@@ -58,13 +45,13 @@ def resolve_boss(code: str):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_chat_id(update.effective_chat.id)
     await update.message.reply_text(
-        "Бот запущен и запомнил этот чат для напоминаний.\n\n"
+        "Привет! Я слежу за респавном боссов Ragnarok лично для тебя — "
+        "твои отметки и напоминания не пересекаются с другими игроками.\n\n"
         "Команды:\n"
         "/kill <код> [ЧЧ:ММ] — отметить убийство босса (без времени — берётся текущее)\n"
         "/list — список боссов и их коды\n"
-        "/status — текущее состояние всех боссов\n"
+        "/status — твоё текущее состояние по всем боссам\n"
         "/cancel <код> — отменить отметку и запланированные напоминания"
     )
 
@@ -79,6 +66,10 @@ async def list_bosses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+def job_name(chat_id: int, code: str, kind: str) -> str:
+    return f"{chat_id}:{code}:{kind}"
+
+
 def schedule_for_boss(app: Application, chat_id: int, code: str, killed_at: datetime):
     b = BOSSES[code]
     warn_at = killed_at + timedelta(minutes=b["min_minutes"] - 10)
@@ -86,19 +77,22 @@ def schedule_for_boss(app: Application, chat_id: int, code: str, killed_at: date
     end_at = killed_at + timedelta(minutes=b["max_minutes"])
     now = datetime.now()
 
-    for job in app.job_queue.get_jobs_by_name(f"{code}_warn") + app.job_queue.get_jobs_by_name(f"{code}_start"):
+    for job in (
+        app.job_queue.get_jobs_by_name(job_name(chat_id, code, "warn"))
+        + app.job_queue.get_jobs_by_name(job_name(chat_id, code, "start"))
+    ):
         job.schedule_removal()
 
     if warn_at > now:
         app.job_queue.run_once(
-            send_warning, when=warn_at, chat_id=chat_id, name=f"{code}_warn", data=code
+            send_warning, when=warn_at, chat_id=chat_id, name=job_name(chat_id, code, "warn"), data=code
         )
     if start_at > now:
         app.job_queue.run_once(
             send_window_start,
             when=start_at,
             chat_id=chat_id,
-            name=f"{code}_start",
+            name=job_name(chat_id, code, "start"),
             data={"code": code, "end_at": end_at},
         )
     return warn_at, start_at, end_at
@@ -151,12 +145,11 @@ async def kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
         killed_at = datetime.now()
 
     chat_id = update.effective_chat.id
-    save_chat_id(chat_id)
-
     warn_at, start_at, end_at = schedule_for_boss(context.application, chat_id, code, killed_at)
 
     data = load_data()
-    data[code] = {
+    chat_key = str(chat_id)
+    data.setdefault(chat_key, {})[code] = {
         "killed_at": killed_at.isoformat(),
         "warn_at": warn_at.isoformat(),
         "start_at": start_at.isoformat(),
@@ -180,15 +173,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Неизвестный код босса: {context.args[0]}. Смотри /list")
         return
 
+    chat_id = update.effective_chat.id
     for job in (
-        context.application.job_queue.get_jobs_by_name(f"{code}_warn")
-        + context.application.job_queue.get_jobs_by_name(f"{code}_start")
+        context.application.job_queue.get_jobs_by_name(job_name(chat_id, code, "warn"))
+        + context.application.job_queue.get_jobs_by_name(job_name(chat_id, code, "start"))
     ):
         job.schedule_removal()
 
     data = load_data()
-    if code in data:
-        del data[code]
+    chat_key = str(chat_id)
+    if chat_key in data and code in data[chat_key]:
+        del data[chat_key][code]
         save_data(data)
 
     await update.message.reply_text(f"Отметка и напоминания для {BOSSES[code]['name']} отменены.")
@@ -196,10 +191,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
+    chat_entries = data.get(str(update.effective_chat.id), {})
     now = datetime.now()
-    lines = ["Статус боссов:"]
+    lines = ["Твой статус боссов:"]
     for code, b in BOSSES.items():
-        entry = data.get(code)
+        entry = chat_entries.get(code)
         if not entry:
             lines.append(f"• {b['name']}: нет отметки об убийстве")
             continue
@@ -217,18 +213,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def reschedule_pending(app: Application):
-    chat_id = load_chat_id()
-    if chat_id is None:
-        return
     data = load_data()
     now = datetime.now()
-    for code, entry in data.items():
-        end_at = datetime.fromisoformat(entry["end_at"])
-        if end_at < now:
-            continue
-        killed_at = datetime.fromisoformat(entry["killed_at"])
-        schedule_for_boss(app, chat_id, code, killed_at)
-    log.info("Restored %d pending boss timers", len(data))
+    restored = 0
+    for chat_key, entries in data.items():
+        chat_id = int(chat_key)
+        for code, entry in entries.items():
+            end_at = datetime.fromisoformat(entry["end_at"])
+            if end_at < now:
+                continue
+            killed_at = datetime.fromisoformat(entry["killed_at"])
+            schedule_for_boss(app, chat_id, code, killed_at)
+            restored += 1
+    log.info("Restored %d pending boss timers across all users", restored)
 
 
 def main():
