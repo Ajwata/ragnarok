@@ -1,5 +1,6 @@
 .env
 data.json
+custom_bosses.json
 chat_id.txt
 __pycache__/
 *.pyc
