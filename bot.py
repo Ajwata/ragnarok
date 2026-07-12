@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -580,6 +581,13 @@ def reschedule_pending(app: Application):
     log.info("Restored %d pending boss timers across all users", restored)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        log.warning("Another bot instance is polling with the same token (will keep retrying).")
+        return
+    log.error("Unhandled exception", exc_info=context.error)
+
+
 async def post_init(app: Application):
     await app.bot.set_my_commands(
         [
@@ -622,6 +630,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(boss_wizard)
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
 
     reschedule_pending(app)
 
